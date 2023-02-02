@@ -145,7 +145,8 @@ df['tmt'] = df['bond_maturity']
 
 # Risk-free rate #
 ff3 = pd.read_csv\
-    (r'~\rf.csv')
+    ('rf.csv')
+    
 ff3 = ff3[['date','RF']]       
 ff3['date'] = pd.to_datetime(ff3['date'], format = "%Y%m")
 ff3['date']  = ff3['date']  + MonthEnd(0)
@@ -153,17 +154,18 @@ ff3 = ff3.set_index(['date'])
 ff3 = ff3 / 100
 
 # Macroeconomic Uncertainty Factor #
-unc = pd.read_csv(r'~\macro_uncertainty.csv')
+unc = pd.read_csv('macro_uncertainty.csv')
 unc['date'] = pd.to_datetime(unc['date'] , format = "%Y-%m-%d")
 unc['date'] = unc['date']+MonthEnd(0)
 unc = unc.set_index(['date'])
 unc = unc['unc'].diff()
 
 # read BBW Factors #
-bbw = pd.read_csv(r'~\bbw4_original.csv')
+bbw = pd.read_csv('bbw4_original.csv')
 bbw['date'] = pd.to_datetime(bbw['date'] , format = "%Y%m")
 bbw['date'] = bbw['date']+MonthEnd(0)
 bbw = bbw.set_index(['date'])
+bbw = bbw/100
 
 # Merge
 df = df.set_index(['date','cusip'])
@@ -175,13 +177,16 @@ df = df.merge(unc, how = "inner", left_index=True,
               right_index = True)
 df = df.merge(bbw, how = "inner", left_index=True, 
               right_index = True)
+
+df = df[~df.index.duplicated()]
 #* ************************************** */
 #* Subset columns                         */
 #* ************************************** */ 
 df.rename(columns={'ret_l5m':'bond_ret',
-                   'yield':'yld'}, inplace=True) 
+                   'yield':'yld',
+                   'price_l5m':'bond_prc'}, inplace=True) 
 df['Q_M'] = 'T'
-df = df[[ 'exretn' , 'bond_ret', 'bond_amount_out' ,'offering_amt' , 
+df = df[[ 'exretn' , 'bond_ret','bond_prc', 'bond_amount_out' ,'offering_amt' , 
           'spr_mr_fill','mr_spr_fill', 'rat',
           'yld','tmt','Q_M' ,'sic_code',
           'unc','MKTbond']]
@@ -228,8 +233,12 @@ def rolling_risk(dfstock, factors, returns, window, min_periods):
 #* ************************************** */ 
 dfBeta = df[['exretn',
              'MKTbond',
-             'unc']].dropna()
-      
+             'unc',
+             'bond_prc']].dropna()
+
+dfBeta = dfBeta[(dfBeta.bond_prc > 5)]
+dfBeta = dfBeta[(dfBeta.bond_prc < 1000)]
+     
 factors = [ 'MKTbond',
             'unc']
 
@@ -261,8 +270,12 @@ df = df.reset_index().merge(RiskPrices, how = "left", left_on  = ['cusip','date'
 #* ************************************** */
 #* Forward return                         */
 #* ************************************** */  
+# Lead return so we sort on the beta available
+# to the investor at time t,
+# and record the return from t:t+1
+# we lag the final sorts at the end to align the dat index
 df['exret(t+1)']  = df.groupby("cusip")['exretn'].shift(-1)
-df['date(t+1)']   = df.groupby("cusip")['date'].shift(-1)
+df['date(t+1)']   = df.groupby("cusip")['date']  .shift(-1)
 
 # Ensure that between each return observation, there
 # is exactly a 1-Month gap (i.e. maximum of 31-Days)
@@ -270,6 +283,14 @@ df['date(t+1)']   = df.groupby("cusip")['date'].shift(-1)
 # this provides an additional check
 df['days'] = (df['date(t+1)'] - df['date']).dt.days
 df = df[df['days'] <= 31]
+
+#* ************************************** */
+#* BSW Filters      --Main df             */
+#* ************************************** */ 
+df = df[df.tmt       > 1]
+df = df[(df.bond_prc > 5)]
+df = df[(df.bond_prc < 1000)]
+
 
 # Save dataframe
 dfSave = df
@@ -280,6 +301,7 @@ dfSave = df
 df = df[~df.mktb.isnull()]
 df = df[~df.uncb.isnull()]
 df = df[~df['exret(t+1)'].isnull()]
+df = df[~df['exretn'].isnull()]
 
 #* ************************************** */
 #* Single Sort                            */
@@ -296,9 +318,15 @@ df['value-weights-unc'] = df.groupby([ 'date','Quncb' ])\
     ['bond_amount_out'].progress_apply( lambda x: x/np.nansum(x) )
 
 #* ************************************** */
-#* Univariate Portfolio Sorts             */
+#* Sample Statistics                      */
 #* ************************************** */  
+UNC_Beta = df.groupby("date")['uncb'].mean()
+UNC_Beta.mean()
+UNC_Beta.plot()
 
+MKTB_Beta = df.groupby("date")['mktb'].mean()
+MKTB_Beta.mean()
+MKTB_Beta.plot()
 
 #* ************************************** */
 #* Average Returns & t-Stats              */
