@@ -17,7 +17,7 @@ Besides this, the factors cannot be replicated using any corporate bond database
 The BBW original MKTbond factor also exactly mimics the ICE Investment Grade Index. The original MKTbond factor is used in
 an attempt to be as close as possible to the original paper.
 
-The script then estimates a rolling tim-series regression for each bond in the sample using 36-Months of data,
+The script then estimates a rolling time-series regression for each bond in the sample using 36-Months of data,
 requiring a bond to have a minimum of 24-Months of data for a beta to be computed. This means betas begin at the end of 
 Month 24 in the sample.
 
