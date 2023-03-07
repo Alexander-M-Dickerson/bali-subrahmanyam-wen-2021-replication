@@ -12,7 +12,12 @@ import datetime as datetime
 from pandas.tseries.offsets import *
 import pyreadstat
 import wrds
+import urllib.request
+import zipfile
 import pandasql as ps
+from pandarallel import pandarallel
+import time
+import statsmodels.api as sm 
 tqdm.pandas()
 
 #* ************************************** */
@@ -103,7 +108,6 @@ fisd['dated_date']               = pd.to_datetime(fisd['dated_date'],
 
 fisd.rename(columns={'complete_cusip':'cusip'}, inplace=True)
 
-
 #* ************************************** */
 #* Merge                                  */
 #* ************************************** */ 
@@ -139,38 +143,87 @@ df['mr_spr_fill'] = np.where(df['n_mr'].isnull(),df['n_sp'],df['n_mr'])
 df['rat']         = (df['spr_mr_fill']+df['mr_spr_fill'])/2
 # Bond Yield 
 df['bond_yield'] = df['yield'] 
-
 # Bond Maturity
 df['tmt'] = df['bond_maturity']
 
-# Risk-free rate #
-ff3 = pd.read_csv\
-    ('rf.csv')
-    
-ff3 = ff3[['date','RF']]       
-ff3['date'] = pd.to_datetime(ff3['date'], format = "%Y%m")
-ff3['date']  = ff3['date']  + MonthEnd(0)
-ff3 = ff3.set_index(['date'])
-ff3 = ff3 / 100
+#* ************************************** */
+#* Read in the factors                    */
+#* ************************************** */  
 
-# Macroeconomic Uncertainty Factor #
-unc = pd.read_csv('macro_uncertainty.csv')
+# Fama French 5-Factors and CAPM          
+ff_url = str("https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/")+\
+str("F-F_Research_Data_5_Factors_2x3_CSV.zip")
+
+# Download the file and save it
+# We will name it fama_french.zip file
+
+urllib.request.urlretrieve(ff_url,'fama_french.zip')
+zip_file = zipfile.ZipFile('fama_french.zip', 'r')
+
+# Next we extact the file data
+# We will call it ff_factors.csv
+
+zip_file.extractall()
+# Make sure you close the file after extraction
+zip_file.close()
+
+ff_factors = pd.read_csv('F-F_Research_Data_5_Factors_2x3.csv', skiprows = 3)
+ff_factors = ff_factors.iloc[:714,:]
+ff_factors.rename(columns={'Unnamed: 0':'date',
+                           'Mkt-RF':'MKTS'}, inplace=True)
+ff_factors['date'] = pd.to_datetime(ff_factors['date'], format = "%Y%m")
+ff_factors['date'] = ff_factors['date'] + MonthEnd(0)
+ff_factors = ff_factors.set_index('date')
+ff_factors[ff_factors.columns] =\
+    ff_factors[ff_factors.columns].apply(pd.to_numeric,
+                                         errors='coerce')
+ff_factors = ff_factors / 100
+
+# Macroeconomic Uncertainty Factor #        
+unc_url = str("https://www.sydneyludvigson.com/s/MacroFinanceUncertainty_202302Update.zip")
+
+# Download the file and save it
+# We will name it unc.zip file
+
+urllib.request.urlretrieve(unc_url,'unc.zip')
+zip_file = zipfile.ZipFile('unc.zip', 'r')
+
+# Next we extact the file data
+# We will call it ff_factors.csv
+
+zip_file.extractall()
+# Make sure you close the file after extraction
+zip_file.close()
+
+unc = pd.read_excel('MacroUncertaintyToCirculate.xlsx')
+unc.rename(columns={'Date':'date'}, inplace=True)
 unc['date'] = pd.to_datetime(unc['date'] , format = "%Y-%m-%d")
 unc['date'] = unc['date']+MonthEnd(0)
 unc = unc.set_index(['date'])
-unc = unc['unc'].diff()
+unc.columns = ['unc','unc_3','unc_12']
+unc = unc[['unc']]
+unc['uncd'] = unc['unc'].diff()
+unc['uncd_lag_1'] = unc['uncd'].shift(1)
+unc['uncd_lag_2'] = unc['uncd'].shift(2)
+
 
 # read BBW Factors #
-bbw = pd.read_csv('bbw4_original.csv')
+_url='https://docs.google.com/spreadsheets/d/1stNzNGgu4Varx7_vsTmH1nbo6LiZT8aO/edit#gid=1218371933'
+url='https://drive.google.com/uc?id=' + _url.split('/')[-2]
+bbw = pd.read_excel(url)
+bbw.rename(columns={'yyyymm':'date'}, inplace=True)
 bbw['date'] = pd.to_datetime(bbw['date'] , format = "%Y%m")
 bbw['date'] = bbw['date']+MonthEnd(0)
 bbw = bbw.set_index(['date'])
 bbw = bbw/100
+bbw = bbw[['MKTbond']]
 
 # Merge
 df = df.set_index(['date','cusip'])
-df = df.merge(ff3, how = "inner", left_index=True, 
+df = df.merge(ff_factors[['RF']], how = "inner", left_index=True, 
               right_index = True)
+
+# Compute excess returns #
 df['exretn'] = df['ret_l5m'] - df['RF']
 
 df = df.merge(unc, how = "inner", left_index=True, 
@@ -189,18 +242,24 @@ df['Q_M'] = 'T'
 df = df[[ 'exretn' , 'bond_ret','bond_prc', 'bond_amount_out' ,'offering_amt' , 
           'spr_mr_fill','mr_spr_fill', 'rat',
           'yld','tmt','Q_M' ,'sic_code',
-          'unc','MKTbond']]
+          'uncd','uncd_lag_1', 'uncd_lag_2','MKTbond']]
  
-#* ************************************** */
-#* Subset columns                         */
-#* ************************************** */ 
-import statsmodels.api as sm
-def rolling_sub_all( exret, factors ):       
-        model2 = sm.OLS(exret, sm.add_constant(factors), missing='drop').fit()  
-        out    =  list( model2.params[1:]  )  
-        return out
 
-def rolling_risk(dfstock, factors, returns, window, min_periods):             
+#* ************************************** */
+#* Rolling beta function                  */
+#* ************************************** */
+
+def rolling_risk(dfstock, factors, returns, window, min_periods): 
+        import pandas as pd
+        import numpy as np        
+        
+        def rolling_sub_all( exret, factors ):  
+                import statsmodels.api as sm     
+                model2 = sm.OLS(exret, sm.add_constant(factors), missing='drop').fit()  
+                out    =  list( model2.params[1:]  ) 
+                # out.extend(    model2.bse[1:]      )             
+                return out
+            
         risk_prices = pd.DataFrame(index = range(0,len(dfstock)), columns = ['A'] )
         risk_prices['A'] = risk_prices['A'].astype('object')
         
@@ -225,48 +284,76 @@ def rolling_risk(dfstock, factors, returns, window, min_periods):
                   continue          
         dfstock['risk_prices'] = risk_prices['A'].tolist()
         dfstock.reset_index(level=dfstock.index.names[0], inplace=True)
-        return dfstock['risk_prices']      
-
+        return dfstock['risk_prices']        
 
 #* ************************************** */
-#* Subset columns                         */
-#* ************************************** */ 
-dfBeta = df[['exretn',
-             'MKTbond',
-             'unc',
-             'bond_prc']].dropna()
-
-dfBeta = dfBeta[(dfBeta.bond_prc > 5)]
-dfBeta = dfBeta[(dfBeta.bond_prc < 1000)]
-     
-factors = [ 'MKTbond',
-            'unc']
+#* Models                                 */
+#* ************************************** */
+models = [list(['MKTbond','uncd']), 
+          list(['MKTbond','uncd_lag_1']), 
+          list(['MKTbond','uncd_lag_2']), 
+          ]
 
 returns = ['exretn']
+df = df.reset_index().set_index(['cusip',
+                                 'date']).sort_index(level = ['cusip',
+                                                              'date'])
+df = df[~df.exretn.isnull()]
 
-dfBeta = dfBeta.reset_index().set_index(['cusip','date'])
+# Initialization
+from pandarallel import pandarallel
+import time
+pandarallel.initialize(progress_bar=False)# For groupby, this is ugly!
+returns = 'exretn'
+df = df.reset_index()
 
 #* ************************************** */
-#* Run Rolling regression                 */
-#* ************************************** */ 
-RiskPrices = dfBeta.groupby(\
-                       level=dfBeta.index.names[0]).progress_apply( rolling_risk, 
-                       factors = factors, returns = returns, 
-                       window = 36 , min_periods = 24).to_frame()
-
-RiskPrices.columns = ['tolistcol']
-RiskPrices = RiskPrices.tolistcol.progress_apply(pd.Series)
-
-RiskPrices.columns = [   'mktb','uncb'  ]
-RiskPrices = RiskPrices.sort_index(level = "cusip")
-RiskPrices = RiskPrices.reset_index()
-
-
-# Merge #
-df = df.reset_index().merge(RiskPrices, how = "left", left_on  = ['cusip','date'],
-                                    right_on = ['cusip','date'])
-
-
+#* Compute betas                          */
+#* ************************************** */
+for i,m in enumerate(models):
+    print(i,m)
+    
+    if   i == 0:        
+        col_names = ['MKTBuncd','UNCD']
+    elif i == 1:        
+        col_names = ['MKTBuncd1','UNCD1']
+    elif i == 2:       
+        col_names = ['MKTBuncd2','UNCD2']
+        
+    # Break data into chunks -- makes life easier #
+    CUSIPs = list(df['cusip'].unique())
+    c       = 7500
+    chunks  = [CUSIPs[x:x+c] for x in range(0, len(CUSIPs), c)]
+    df_risk_prices = pd.DataFrame()
+        
+    for l in range(0,len(chunks)):
+        print(l)
+        _df_chunk = pd.DataFrame(chunks[l], columns = ['cusip'])
+        df_chunk  = df[(df['cusip'].isin(_df_chunk['cusip']))]
+        df_chunk  = df_chunk.set_index(['cusip',
+                                        'date']).sort_index(level = ['cusip',
+                                                                     'date'])      
+        t0 = time.time()
+        _risk_prices = df_chunk.groupby(level=df_chunk.index.names[0])\
+                     .parallel_apply( rolling_risk, 
+                               factors = m, returns = returns, 
+                               window = 36 , min_periods = 24).to_frame()       
+        _risk_prices.columns = ['tolistcol']    
+        _risk_prices = _risk_prices.tolistcol.parallel_apply(pd.Series).\
+                                             sort_index(level = "cusip")
+        _risk_prices.columns =   col_names        
+        t1 = time.time()
+        print( t1-t0 )
+        
+        # Concat #
+        df_risk_prices = pd.concat([df_risk_prices , _risk_prices ],
+                                    axis = 0)
+        
+    df = df.merge(df_risk_prices.reset_index(),
+                  how = "left",
+                  left_on = ['date','cusip'],
+                  right_on = ['date','cusip']) 
+        
 #* ************************************** */
 #* Forward return                         */
 #* ************************************** */  
@@ -298,8 +385,7 @@ dfSave = df
 #* ************************************** */
 #* Drop NaN                               */
 #* ************************************** */  
-df = df[~df.mktb.isnull()]
-df = df[~df.uncb.isnull()]
+df = df[~df.MKTBuncd.isnull()]
 df = df[~df['exret(t+1)'].isnull()]
 df = df[~df['exretn'].isnull()]
 
@@ -307,9 +393,9 @@ df = df[~df['exretn'].isnull()]
 #* Single Sort                            */
 #* ************************************** */  
 n = 5
-df['Qmktb']  = df.groupby(by = ['date'])['mktb'].\
+df['Qmktb']  = df.groupby(by = ['date'])['MKTBuncd2'].\
     progress_apply(lambda x: pd.qcut(x,n,labels=False,duplicates='drop')+1) 
-df['Quncb']  = df.groupby(by = ['date'])['uncb'].\
+df['Quncb']  = df.groupby(by = ['date'])['UNCD2'].\
     progress_apply(lambda x: pd.qcut(x,n,labels=False,duplicates='drop')+1) 
 
 df['value-weights-mktb'] = df.groupby([ 'date','Qmktb' ])\
@@ -320,11 +406,11 @@ df['value-weights-unc'] = df.groupby([ 'date','Quncb' ])\
 #* ************************************** */
 #* Sample Statistics                      */
 #* ************************************** */  
-UNC_Beta = df.groupby("date")['uncb'].mean()
+UNC_Beta = df.groupby("date")['UNCD'].mean()
 UNC_Beta.mean()
 UNC_Beta.plot()
 
-MKTB_Beta = df.groupby("date")['mktb'].mean()
+MKTB_Beta = df.groupby("date")['MKTBuncd'].mean()
 MKTB_Beta.mean()
 MKTB_Beta.plot()
 
@@ -362,7 +448,7 @@ tstats= list()
 for i in range(0,(n+1)):        
     regB = sm.OLS(sortsAll.iloc[:,i].values,
                   pd.DataFrame(np.tile(1,(len(sortsAll.iloc[:,i]),1)) ).values ,
-                  ).fit(cov_type='HAC',cov_kwds={'maxlags':12})
+                  ).fit(cov_type='HAC',cov_kwds={'maxlags':3})
     tstats.append(np.round(regB.tvalues[0],2))  
 
 Mean       = (pd.DataFrame(np.array(sortsAll.mean())) * 100).round(3)         
@@ -379,9 +465,9 @@ weight   = 'value-weights-unc'
 Q        = 'Quncb'
 dfIG     = df[df.rat <= 10]
 
-dfIG['Qmktb']  = dfIG.groupby(by = ['date'])['mktb'].\
+dfIG['Qmktb']  = dfIG.groupby(by = ['date'])['MKTBuncd2'].\
     progress_apply(lambda x: pd.qcut(x,n,labels=False,duplicates='drop')+1) 
-dfIG['Quncb']  = dfIG.groupby(by = ['date'])['uncb'].\
+dfIG['Quncb']  = dfIG.groupby(by = ['date'])['UNCD2'].\
     progress_apply(lambda x: pd.qcut(x,n,labels=False,duplicates='drop')+1) 
 
 dfIG['value-weights-mktb'] = dfIG.groupby([ 'date','Qmktb' ])\
@@ -432,9 +518,9 @@ weight   = 'value-weights-unc'
 Q        = 'Quncb'
 dfNIG     = df[df.rat > 10]
 
-dfNIG['Qmktb']  = dfNIG.groupby(by = ['date'])['mktb'].\
+dfNIG['Qmktb']  = dfNIG.groupby(by = ['date'])['MKTBuncd2'].\
     progress_apply(lambda x: pd.qcut(x,n,labels=False,duplicates='drop')+1) 
-dfNIG['Quncb']  = dfNIG.groupby(by = ['date'])['uncb'].\
+dfNIG['Quncb']  = dfNIG.groupby(by = ['date'])['UNCD2'].\
     progress_apply(lambda x: pd.qcut(x,n,labels=False,duplicates='drop')+1) 
 
 dfNIG['value-weights-mktb'] = dfNIG.groupby([ 'date','Qmktb' ])\
