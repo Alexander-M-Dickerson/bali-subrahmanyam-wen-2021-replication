@@ -5,8 +5,8 @@ This code repository is written in Python and contains 3 script files which repl
 "The Macroeconomic Uncertainty Premium in the Corporate Bond Market" by Bali, Subrahmanyam and Wen (2021), henceforth BSW.
 
 WRDS Bond Returns Corporate Bond Database Replication Script
-The file entitled "wrds_bali_subrahmanyam_wen_2021_replication.py" replicates their paper with the publicly available 
-bond dataset from thw WRDS Bond Returns Module and requires an academic (or otherwise) subscription to WRDS.
+The file entitled "wrds_bali_subrahmanyam_wen_2021_replication.py" replicates part of their paper with the publicly available 
+bond dataset from the WRDS Bond Returns Module and requires an academic (or otherwise) subscription to WRDS.
 The script directly queries the WRDS Bond Returns database and downloads bond returns, amount outstanding, maturity,
 bond prices and ratings that are required for the replication.
 
